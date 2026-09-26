@@ -1,0 +1,32 @@
+# Virtual environment
+.venv/
+
+# Byte-compiled / cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment and sensitive variables
+.env
+
+# OS junk files
+.DS_Store
+Thumbs.db
+
+# Data directories (ignore contents but track folder structure via .gitkeep)
+data/train/*
+!data/train/.gitkeep
+data/test/*
+!data/test/.gitkeep
+
+# Models directory (ignore artifacts but track folder via .gitkeep)
+models/*
+!models/.gitkeep
+
+# Local outputs directory (ignore scratch output but track folder via .gitkeep)
+outputs/*
+!outputs/.gitkeep
