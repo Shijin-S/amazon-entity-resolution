@@ -2,15 +2,22 @@
 
 import logging
 import gc
+import heapq
+import shutil
 from array import array
 from collections import defaultdict
 from collections.abc import Iterable
+from pathlib import Path
+from tempfile import mkdtemp
 from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
 import pandas as pd
 import psutil
+import pyarrow.dataset as ds
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 LOGGER = logging.getLogger(__name__)
@@ -140,153 +147,327 @@ def _filtered_address_tokens(value: object) -> set[str]:
 	}
 
 
-def _country_positions(frame: pd.DataFrame) -> dict[str, np.ndarray]:
-	"""Map open-string country labels to positional row indexes."""
-	countries = frame["normalized_country"].fillna("").to_numpy(copy=False)
-	positions = pd.Series(np.arange(len(frame), dtype=np.int64))
-	return positions.groupby(countries, sort=False).indices
+_BLOCKING_COLUMNS = ["entity_id", "normalized_name", "address_tokens", "is_non_latin_name"]
 
 
-def _record_arrays(frame: pd.DataFrame) -> dict[str, np.ndarray]:
-	"""Expose only the columns needed by blocking as NumPy arrays."""
-	return {
-		"entity_id": frame["entity_id"].to_numpy(copy=False),
-		"normalized_name": frame["normalized_name"].to_numpy(copy=False),
-		"address_tokens": frame["address_tokens"].to_numpy(copy=False),
-		"is_non_latin_name": frame["is_non_latin_name"].to_numpy(copy=False),
-	}
+class MemorySafetyLimitExceeded(RuntimeError):
+	"""Raised when blocking reaches its configured RSS safety limit."""
+
+	def __init__(self, message: str, candidate_output_path: str):
+		super().__init__(message)
+		self.candidate_output_path = candidate_output_path
 
 
-def _unique_pair_codes(pair_codes: array, minimum_shared_tokens: int = 1) -> np.ndarray:
-	"""Deduplicate encoded pairs and enforce the shared-token threshold."""
-	if not pair_codes:
-		return np.empty(0, dtype=np.uint64)
-	values = np.frombuffer(pair_codes, dtype=np.uint64)
-	if minimum_shared_tokens == 1:
-		return np.unique(values)
-	unique_codes, shared_counts = np.unique(values, return_counts=True)
-	return unique_codes[shared_counts >= minimum_shared_tokens]
+class _CandidateBatchWriter:
+	"""Persist candidate batches independently so partial output survives errors."""
+
+	def __init__(self, output_path: str):
+		self.output_path = Path(output_path)
+		self.output_path.mkdir(parents=True, exist_ok=True)
+		self.batch_count = 0
+		self.row_count = 0
+		self.parquet_writer: pq.ParquetWriter | None = None
+
+	def write(self, candidates: pd.DataFrame) -> None:
+		"""Write one non-empty batch and release it from the caller immediately."""
+		if candidates.empty:
+			return
+		table = pa.Table.from_pandas(candidates, preserve_index=False)
+		if self.parquet_writer is None:
+			self.parquet_writer = pq.ParquetWriter(
+				self.output_path / "candidates.parquet", table.schema
+			)
+		self.parquet_writer.write_table(table, row_group_size=len(candidates))
+		self.batch_count += 1
+		self.row_count += len(candidates)
+
+	def flush(self) -> None:
+		"""Close the Parquet writer so all completed row groups are readable."""
+		if self.parquet_writer is not None:
+			self.parquet_writer.close()
+			self.parquet_writer = None
+		LOGGER.info(
+			"Candidate output checkpoint flushed: path=%s batches=%d rows=%d",
+			self.output_path,
+			self.batch_count,
+			self.row_count,
+		)
 
 
-def _block_country_partition(
-	source1_positions: np.ndarray,
-	target_positions: np.ndarray,
-	source1_records: dict[str, np.ndarray],
-	target_records: dict[str, np.ndarray],
+def _check_memory_safety(
+	process: psutil.Process,
+	limit_mb: int,
+	writer: _CandidateBatchWriter,
+	country: str,
+	phase: str,
+	batch_number: int,
+) -> float:
+	"""Raise before processing a batch when process RSS exceeds the safety limit."""
+	rss_mb = process.memory_info().rss / 1024 / 1024
+	if rss_mb > limit_mb:
+		message = (
+			"Memory safety limit exceeded: "
+			f"country={country!r} phase={phase} batch={batch_number} "
+			f"rss_mb={rss_mb:.1f} limit_mb={limit_mb} "
+			f"candidate_output={writer.output_path} "
+			f"saved_candidate_rows={writer.row_count}"
+		)
+		LOGGER.critical(message)
+		writer.flush()
+		raise MemorySafetyLimitExceeded(message, str(writer.output_path))
+	return rss_mb
+
+
+def _log_index_diagnostics(
+	country: str,
+	candidate_source: str,
+	name_index: dict[tuple[str, str], array],
+	address_index: dict[str, list[array]],
+	dropped_name_keys: set[tuple[str, str]],
+	dropped_address_tokens: set[str],
+) -> None:
+	"""Log index size, most common postings, and high-frequency key counts."""
+	thresholds = (1_000, 10_000, 100_000)
+	name_counts = dict.fromkeys(thresholds, 0)
+	address_counts = dict.fromkeys(thresholds, 0)
+	top_names = heapq.nlargest(
+		20,
+		((key, len(postings)) for key, postings in name_index.items()),
+		key=lambda item: item[1],
+	)
+	top_addresses = heapq.nlargest(
+		20,
+		((token, len(postings[0])) for token, postings in address_index.items()),
+		key=lambda item: item[1],
+	)
+	for postings in name_index.values():
+		length = len(postings)
+		for threshold in thresholds:
+			name_counts[threshold] += length > threshold
+	for postings in address_index.values():
+		length = len(postings[0])
+		for threshold in thresholds:
+			address_counts[threshold] += length > threshold
+	LOGGER.info(
+		"Index diagnostics: country=%r source=%s unique_name_keys=%d "
+		"name_postings_gt_1000=%d gt_10000=%d gt_100000=%d "
+		"top_name_keys=%s dropped_name_keys=%d",
+		country,
+		candidate_source,
+		len(name_index),
+		name_counts[1_000],
+		name_counts[10_000],
+		name_counts[100_000],
+		top_names,
+		len(dropped_name_keys),
+	)
+	LOGGER.info(
+		"Index diagnostics: country=%r source=%s unique_address_tokens=%d "
+		"address_postings_gt_1000=%d gt_10000=%d gt_100000=%d "
+		"top_address_tokens=%s dropped_address_tokens=%d",
+		country,
+		candidate_source,
+		len(address_index),
+		address_counts[1_000],
+		address_counts[10_000],
+		address_counts[100_000],
+		top_addresses,
+		len(dropped_address_tokens),
+	)
+
+
+def _country_filter(country: str) -> ds.Expression:
+	country_field = ds.field("normalized_country")
+	if country == "":
+		return (country_field == "") | country_field.is_null()
+	return country_field == country
+
+
+def _iter_country_batches(
+	path: str,
+	country: str,
+	columns: list[str],
+	batch_size: int,
+) -> Iterable[pd.DataFrame]:
+	dataset = ds.dataset(path, format="parquet")
+	scanner = dataset.scanner(
+		columns=columns,
+		filter=_country_filter(country),
+		batch_size=batch_size,
+		batch_readahead=1,
+		fragment_readahead=1,
+		use_threads=False,
+	)
+	for record_batch in scanner.to_batches():
+		yield record_batch.to_pandas()
+
+
+def _build_target_index(
+	path: str,
+	country: str,
+	candidate_source: str,
+	batch_size: int,
+	name_min_length: int,
+	max_postings_per_token: int,
+	memory_safety_limit_mb: int,
+	process: psutil.Process,
+	writer: _CandidateBatchWriter,
+) -> tuple[
+	list[object],
+	list[tuple[str, ...]],
+	dict[tuple[str, str], array],
+	dict[str, list[array]],
+	set[tuple[str, str]],
+]:
+	"""Incrementally build compact blocking indexes for one target source."""
+	target_ids: list[object] = []
+	target_address_tokens: list[tuple[str, ...]] = []
+	name_index: dict[tuple[str, str], array] = {}
+	address_index: dict[str, list[array]] = {}
+	dropped_name_keys: set[tuple[str, str]] = set()
+	dropped_address_tokens: set[str] = set()
+	for batch_number, batch_frame in enumerate(
+		_iter_country_batches(path, country, _BLOCKING_COLUMNS, batch_size), start=1
+	):
+		rss_mb = _check_memory_safety(
+			process,
+			memory_safety_limit_mb,
+			writer,
+			country,
+			"target_index",
+			batch_number,
+		)
+		LOGGER.info(
+			"Starting blocking batch: country=%r source=%s phase=target_index "
+			"batch=%d rows=%d rss_mb=%.1f",
+			country,
+			candidate_source,
+			batch_number,
+			len(batch_frame),
+			rss_mb,
+		)
+		for entity_id, name, address_tokens, is_non_latin in batch_frame.itertuples(
+			index=False, name=None
+		):
+			target_position = len(target_ids)
+			target_ids.append(entity_id)
+			fallback = _needs_address_fallback(name, is_non_latin, name_min_length)
+			name_key = None if is_non_latin else _name_block_key(name, name_min_length)
+			tokens = _filtered_address_tokens(address_tokens)
+			target_address_tokens.append(tuple(tokens) if name_key is not None else ())
+			if name_key is not None and name_key not in dropped_name_keys:
+				name_postings = name_index.get(name_key)
+				original_length = 1 if name_postings is None else len(name_postings) + 1
+				if original_length > max_postings_per_token:
+					name_index.pop(name_key, None)
+					dropped_name_keys.add(name_key)
+					LOGGER.warning(
+						"Dropped name block key %r: original posting-list length=%d "
+						"exceeds max_postings_per_token=%d",
+						name_key,
+						original_length,
+						max_postings_per_token,
+					)
+				else:
+					if name_postings is None:
+						name_postings = array("I")
+						name_index[name_key] = name_postings
+					name_postings.append(target_position)
+
+			for token in tokens:
+				if token in dropped_address_tokens:
+					continue
+				postings = address_index.get(token)
+				original_length = 1 if postings is None else len(postings[0]) + 1
+				if original_length > max_postings_per_token:
+					address_index.pop(token, None)
+					dropped_address_tokens.add(token)
+					LOGGER.warning(
+						"Dropped address token %r: original posting-list length=%d "
+						"exceeds max_postings_per_token=%d",
+						token,
+						original_length,
+						max_postings_per_token,
+					)
+					continue
+				if postings is None:
+					postings = [array("I"), array("I")]
+					address_index[token] = postings
+				postings[0].append(target_position)
+				if fallback:
+					postings[1].append(target_position)
+		del batch_frame
+		gc.collect()
+	_log_index_diagnostics(
+		country,
+		candidate_source,
+		name_index,
+		address_index,
+		dropped_name_keys,
+		dropped_address_tokens,
+	)
+	return target_ids, target_address_tokens, name_index, address_index, dropped_name_keys
+
+
+def _block_source1_batch(
+	source1_frame: pd.DataFrame,
+	target_ids: list[object],
+	target_address_tokens: list[tuple[str, ...]],
+	name_index: dict[tuple[str, str], array],
+	address_index: dict[str, list[array]],
+	dropped_name_keys: set[tuple[str, str]],
 	candidate_source: str,
 	name_min_length: int,
 	min_shared_address_tokens: int,
 ) -> tuple[pd.DataFrame, int, int]:
-	"""Generate and locally deduplicate pairs for one country/source partition."""
-	target_count = len(target_positions)
-	# A country has far fewer than 2^32 rows at the target dataset scale, so
-	# compact posting arrays substantially reduce index memory vs Python integers.
-	name_index: dict[tuple[str, str], array] = {}
-	for target_local, target_global in enumerate(target_positions):
-		if target_records["is_non_latin_name"][target_global]:
-			continue
-		key = _name_block_key(target_records["normalized_name"][target_global], name_min_length)
-		if key is not None:
-			postings = name_index.get(key)
-			if postings is None:
-				postings = array("I")
-				name_index[key] = postings
-			postings.append(target_local)
+	"""Match one Source1 batch against a complete country-local target index."""
+	pairs: list[tuple[object, object, str, str]] = []
+	name_pair_count = 0
+	address_pair_count = 0
+	for source1_id, name, address_tokens, is_non_latin in source1_frame[
+		["entity_id", "normalized_name", "address_tokens", "is_non_latin_name"]
+	].itertuples(index=False, name=None):
+		address_tokens_set = _filtered_address_tokens(address_tokens)
+		name_key = None if is_non_latin else _name_block_key(name, name_min_length)
+		name_hits = list(name_index.get(name_key, ())) if name_key is not None else []
+		name_pair_count += len(name_hits)
 
-	name_pair_codes = array("Q")
-	address_pair_codes = array("Q")
-	for source1_local, source1_global in enumerate(source1_positions):
-		if source1_records["is_non_latin_name"][source1_global]:
-			continue
-		key = _name_block_key(source1_records["normalized_name"][source1_global], name_min_length)
-		if key is None:
-			continue
-		source1_address_tokens = _filtered_address_tokens(
-			source1_records["address_tokens"][source1_global]
-		)
-		for target_local in name_index.get(key, ()):
-			pair_code = source1_local * target_count + target_local
-			name_pair_codes.append(pair_code)
-			# Check address corroboration only among existing name candidates; a
-			# global address join here would sharply increase recall but can explode
-			# common-token blocks. The independent fallback below still covers
-			# uncertain-name pairs.
-			if min_shared_address_tokens == 1 or source1_address_tokens:
-				target_address_tokens = _filtered_address_tokens(
-					target_records["address_tokens"][target_positions[target_local]]
-				)
-				shared_count = len(source1_address_tokens & target_address_tokens)
-				if shared_count >= min_shared_address_tokens:
-					address_pair_codes.extend([pair_code] * shared_count)
+		name_address_hits = {
+			target_position
+			for target_position in name_hits
+			if len(address_tokens_set.intersection(target_address_tokens[target_position]))
+			>= min_shared_address_tokens
+		}
 
-	name_codes = _unique_pair_codes(name_pair_codes)
-	del name_index, name_pair_codes
-
-	# One token index stores all target postings plus a fallback-only posting
-	# list. This finds pairs when either endpoint needs address matching without
-	# keeping two complete indexes resident at once.
-	address_index: dict[str, list[array]] = {}
-	for target_local, target_global in enumerate(target_positions):
-		fallback = _needs_address_fallback(
-			target_records["normalized_name"][target_global],
-			target_records["is_non_latin_name"][target_global],
-			name_min_length,
-		)
-		for token in _filtered_address_tokens(target_records["address_tokens"][target_global]):
-			postings = address_index.get(token)
-			if postings is None:
-				postings = [array("I"), array("I")]
-				address_index[token] = postings
-			postings[0].append(target_local)
-			if fallback:
-				postings[1].append(target_local)
-
-	for source1_local, source1_global in enumerate(source1_positions):
-		fallback = _needs_address_fallback(
-			source1_records["normalized_name"][source1_global],
-			source1_records["is_non_latin_name"][source1_global],
-			name_min_length,
+		fallback = _needs_address_fallback(name, is_non_latin, name_min_length) or (
+			name_key is not None and name_key in dropped_name_keys
 		)
 		posting_position = 0 if fallback else 1
-		for token in _filtered_address_tokens(source1_records["address_tokens"][source1_global]):
+		address_hit_counts: dict[int, int] = defaultdict(int)
+		for token in address_tokens_set:
 			postings = address_index.get(token)
-			if postings is None:
-				continue
-			# Fallback Source1 records compare to all targets; ordinary Source1
-			# records compare only to fallback targets. This captures mixed-script
-			# true pairs without paying for address joins across every ordinary
-			# record on both sides.
-			for target_local in postings[posting_position]:
-				address_pair_codes.append(source1_local * target_count + target_local)
+			if postings is not None:
+				for target_position in postings[posting_position]:
+					address_hit_counts[target_position] += 1
 
-	address_codes = _unique_pair_codes(address_pair_codes, min_shared_address_tokens)
-	del address_index, address_pair_codes
-
-	if not len(name_codes) and not len(address_codes):
-		return pd.DataFrame(columns=_OUTPUT_COLUMNS), 0, 0
-
-	all_codes = np.union1d(name_codes, address_codes)
-	name_hits = np.isin(all_codes, name_codes, assume_unique=True)
-	address_hits = np.isin(all_codes, address_codes, assume_unique=True)
-	reasons = np.where(
-		name_hits & address_hits,
-		"both",
-		np.where(name_hits, "name", "address_token"),
-	)
-	source1_local_positions = (all_codes // target_count).astype(np.int64)
-	target_local_positions = (all_codes % target_count).astype(np.int64)
-	source1_global_positions = source1_positions[source1_local_positions]
-	target_global_positions = target_positions[target_local_positions]
-
-	pairs = pd.DataFrame(
-		{
-			"source1_entity_id": source1_records["entity_id"][source1_global_positions],
-			"candidate_entity_id": target_records["entity_id"][target_global_positions],
-			"candidate_source": candidate_source,
-			"block_reason": reasons,
+		fallback_address_hits = {
+			target_position
+			for target_position, shared_tokens in address_hit_counts.items()
+			if shared_tokens >= min_shared_address_tokens
 		}
-	)
-	return pairs, len(name_codes), len(address_codes)
+		address_hits = name_address_hits | fallback_address_hits
+		address_pair_count += len(address_hits)
+		name_hit_set = set(name_hits)
+		for target_position in sorted(name_hit_set | address_hits):
+			if target_position in name_hit_set and target_position in address_hits:
+				reason = "both"
+			elif target_position in name_hit_set:
+				reason = "name"
+			else:
+				reason = "address_token"
+			pairs.append((source1_id, target_ids[target_position], candidate_source, reason))
+
+	return pd.DataFrame(pairs, columns=_OUTPUT_COLUMNS), name_pair_count, address_pair_count
 
 
 def _combine_block_reasons(reasons: Iterable[str]) -> str:
@@ -305,87 +486,146 @@ def generate_candidate_pairs(
 	*,
 	name_min_length: int = 4,
 	min_shared_address_tokens: int = 1,
-) -> pd.DataFrame:
+	batch_size: int = 300_000,
+	match_batch_size: int = 64,
+	max_postings_per_token: int = 2_000,
+	memory_safety_limit_mb: int = 9_000,
+	countries: list[str] | None = None,
+	candidate_output_dir: str | None = None,
+	return_candidate_dataframe: bool = False,
+) -> pd.DataFrame | str:
 	"""Generate only Source1-vs-Source2/3 candidates using country-local indexes.
 
-	The name length and shared-address-token thresholds are configurable. No
-	Source2-to-Source3 comparison is performed.
+	The thresholds and batch sizes are configurable. Every candidate batch is
+	written to Parquet immediately. Set ``return_candidate_dataframe=False`` to
+	return the output directory path without loading all candidates into memory.
+	Optionally restrict processing to selected countries. No Source2-to-Source3
+	comparison is performed.
 	"""
 	if name_min_length < 1:
 		raise ValueError("name_min_length must be at least 1")
 	if min_shared_address_tokens < 1:
 		raise ValueError("min_shared_address_tokens must be at least 1")
+	if batch_size < 1:
+		raise ValueError("batch_size must be at least 1")
+	if match_batch_size < 1:
+		raise ValueError("match_batch_size must be at least 1")
+	if max_postings_per_token < 1:
+		raise ValueError("max_postings_per_token must be at least 1")
+	if memory_safety_limit_mb < 1:
+		raise ValueError("memory_safety_limit_mb must be at least 1")
 
-	candidate_chunks: list[pd.DataFrame] = []
+	if candidate_output_dir is None:
+		output_path = mkdtemp(prefix="entity-resolution-candidates-")
+	else:
+		output_root = Path(candidate_output_dir)
+		output_root.mkdir(parents=True, exist_ok=True)
+		output_path = mkdtemp(prefix="run-", dir=output_root)
+	writer = _CandidateBatchWriter(output_path)
 	name_pair_count = 0
 	address_pair_count = 0
 	process = psutil.Process()
 	LOGGER.info("Blocking function entry: rss_mb=%.1f", process.memory_info().rss / 1024 / 1024)
-	source1_countries = (
-		pd.read_parquet(source1_path, columns=["normalized_country"])
-		["normalized_country"]
-		.fillna("")
-		.drop_duplicates()
-		.tolist()
-	)
-	source1_count = 0
+	source1_country_column = pd.read_parquet(source1_path, columns=["normalized_country"])[
+		"normalized_country"
+	].fillna("")
+	source1_country_counts = source1_country_column.value_counts().to_dict()
+	source1_countries = list(source1_country_counts)
+	del source1_country_column
+	gc.collect()
+	if countries is not None:
+		requested_countries = set(countries)
+		source1_countries = [
+			country for country in source1_countries if country in requested_countries
+		]
+	source1_count = sum(source1_country_counts[country] for country in source1_countries)
 	source2_count = 0
 	source3_count = 0
 	country_partition_count = len(source1_countries)
 	for country in source1_countries:
-		filters = [("normalized_country", "==", country)]
-		source1_partition = pd.read_parquet(source1_path, filters=filters).reset_index(drop=True)
-		source2_partition = pd.read_parquet(source2_path, filters=filters).reset_index(drop=True)
-		source3_partition = pd.read_parquet(source3_path, filters=filters).reset_index(drop=True)
-		source1_count += len(source1_partition)
-		source2_count += len(source2_partition)
-		source3_count += len(source3_partition)
 		LOGGER.info(
-			"Starting country partition: country=%r source1_rows=%d source2_rows=%d "
-			"source3_rows=%d rss_mb=%.1f",
+			"Starting country partition: country=%r source1_rows=%d rss_mb=%.1f",
 			country,
-			len(source1_partition),
-			len(source2_partition),
-			len(source3_partition),
+			source1_country_counts[country],
 			process.memory_info().rss / 1024 / 1024,
 		)
-
-		source1_records = _record_arrays(source1_partition)
-		source1_positions = np.arange(len(source1_partition), dtype=np.int64)
-		for candidate_source, target_partition in (
-			("source2", source2_partition),
-			("source3", source3_partition),
+		for candidate_source, target_path in (
+			("source2", source2_path),
+			("source3", source3_path),
 		):
-			if target_partition.empty:
-				continue
-			target_records = _record_arrays(target_partition)
-			target_positions = np.arange(len(target_partition), dtype=np.int64)
-			country_pairs, country_name_count, country_address_count = _block_country_partition(
-				source1_positions,
-				target_positions,
-				source1_records,
-				target_records,
+			(
+				target_ids,
+				target_address_tokens,
+				name_index,
+				address_index,
+				dropped_name_keys,
+			) = _build_target_index(
+				target_path,
+				country,
 				candidate_source,
+				batch_size,
 				name_min_length,
-				min_shared_address_tokens,
+				max_postings_per_token,
+				memory_safety_limit_mb,
+				process,
+				writer,
 			)
-			name_pair_count += country_name_count
-			address_pair_count += country_address_count
-			if not country_pairs.empty:
-				candidate_chunks.append(country_pairs)
-			del target_records, target_positions, country_pairs
-
-		# Release all country-local frames, arrays, indexes, and temporary pair
-		# buffers before the next country. This bounds peak memory by the largest
-		# single country partition rather than accumulating both countries.
-		del (
-			source1_records,
-			source1_positions,
-			source1_partition,
-			source2_partition,
-			source3_partition,
-		)
-		gc.collect()
+			if candidate_source == "source2":
+				source2_count += len(target_ids)
+			else:
+				source3_count += len(target_ids)
+			for batch_number, source1_batch in enumerate(
+				_iter_country_batches(
+					source1_path,
+					country,
+					_BLOCKING_COLUMNS,
+					min(batch_size, match_batch_size),
+				),
+				start=1,
+			):
+				rss_mb = _check_memory_safety(
+					process,
+					memory_safety_limit_mb,
+					writer,
+					country,
+					"source1_match",
+					batch_number,
+				)
+				LOGGER.info(
+					"Starting blocking batch: country=%r source=%s phase=source1_match "
+					"batch=%d rows=%d rss_mb=%.1f",
+					country,
+					candidate_source,
+					batch_number,
+					len(source1_batch),
+					rss_mb,
+				)
+				country_pairs, country_name_count, country_address_count = _block_source1_batch(
+					source1_batch,
+					target_ids,
+					target_address_tokens,
+					name_index,
+					address_index,
+					dropped_name_keys,
+					candidate_source,
+					name_min_length,
+					min_shared_address_tokens,
+				)
+				name_pair_count += country_name_count
+				address_pair_count += country_address_count
+				writer.write(country_pairs)
+				del source1_batch, country_pairs
+				gc.collect()
+				_check_memory_safety(
+					process,
+					memory_safety_limit_mb,
+					writer,
+					country,
+					"source1_match_after_batch",
+					batch_number,
+				)
+			del target_ids, target_address_tokens, name_index, address_index, dropped_name_keys
+			gc.collect()
 		LOGGER.info(
 			"Finished country partition: country=%r rss_mb=%.1f",
 			country,
@@ -393,19 +633,24 @@ def generate_candidate_pairs(
 		)
 	del source1_countries
 
-	if candidate_chunks:
-		candidate_pairs = pd.concat(candidate_chunks, ignore_index=True)
+	writer.flush()
+	unique_pair_count = writer.row_count
+	if return_candidate_dataframe:
+		candidate_pairs = (
+			pd.read_parquet(writer.output_path)
+			if writer.batch_count
+			else pd.DataFrame(columns=_OUTPUT_COLUMNS)
+		)
 		pair_columns = ["source1_entity_id", "candidate_entity_id", "candidate_source"]
 		if candidate_pairs.duplicated(pair_columns).any():
 			candidate_pairs = (
 				candidate_pairs.groupby(pair_columns, sort=False, as_index=False)["block_reason"]
 				.agg(_combine_block_reasons)
 			)
-	else:
-		candidate_pairs = pd.DataFrame(columns=_OUTPUT_COLUMNS)
+		unique_pair_count = len(candidate_pairs)
+		shutil.rmtree(writer.output_path)
 
 	naive_pair_count = source1_count * (source2_count + source3_count)
-	unique_pair_count = len(candidate_pairs)
 	average_per_source1 = unique_pair_count / source1_count if source1_count else 0.0
 	reduction_ratio = (
 		1.0 - unique_pair_count / naive_pair_count if naive_pair_count else 0.0
@@ -425,7 +670,9 @@ def generate_candidate_pairs(
 		naive_pair_count,
 		reduction_ratio,
 	)
-	return candidate_pairs.loc[:, _OUTPUT_COLUMNS]
+	if return_candidate_dataframe:
+		return candidate_pairs.loc[:, _OUTPUT_COLUMNS]
+	return str(writer.output_path)
 
 
 def _split_matched_ids(value: object) -> list[str]:
@@ -463,6 +710,7 @@ def _load_recall_metadata(
 	source3_path: str,
 	source1_ids: set[object],
 	target_ids: set[object],
+	batch_size: int = 300_000,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
 	"""Load only metadata rows referenced by recall, one country at a time."""
 	source1_chunks: list[pd.DataFrame] = []
@@ -476,27 +724,24 @@ def _load_recall_metadata(
 		.tolist()
 	)
 	for country in countries:
-		filters = [("normalized_country", "==", country)]
-		source1_partition = pd.read_parquet(
+		for batch in _iter_country_batches(
 			source1_path,
-			columns=["entity_id", "normalized_name", "is_non_latin_name"],
-			filters=filters,
-		)
-		matched_source1 = source1_partition.loc[source1_partition["entity_id"].isin(source1_ids)]
-		if not matched_source1.empty:
-			source1_chunks.append(matched_source1)
-		del source1_partition
-
-		for path, chunks in ((source2_path, source2_chunks), (source3_path, source3_chunks)):
-			partition = pd.read_parquet(
-				path,
-				columns=["entity_id", "is_non_latin_name"],
-				filters=filters,
-			)
-			matched = partition.loc[partition["entity_id"].isin(target_ids)]
+			country,
+			["entity_id", "normalized_name", "is_non_latin_name"],
+			batch_size,
+		):
+			matched = batch.loc[batch["entity_id"].isin(source1_ids)]
 			if not matched.empty:
-				chunks.append(matched)
-			del partition
+				source1_chunks.append(matched.copy())
+			del batch, matched
+		for path, chunks in ((source2_path, source2_chunks), (source3_path, source3_chunks)):
+			for batch in _iter_country_batches(
+				path, country, ["entity_id", "is_non_latin_name"], batch_size
+			):
+				matched = batch.loc[batch["entity_id"].isin(target_ids)]
+				if not matched.empty:
+					chunks.append(matched.copy())
+				del batch, matched
 		gc.collect()
 
 	def combine(chunks: list[pd.DataFrame], columns: list[str]) -> pd.DataFrame:
@@ -516,6 +761,7 @@ def evaluate_blocking_recall(
 	source1_path: str | None = None,
 	source2_path: str | None = None,
 	source3_path: str | None = None,
+		batch_size: int = 300_000,
 ) -> dict[str, Any]:
 	"""Measure pair-level blocking recall and report missed Source1 examples.
 
@@ -530,6 +776,8 @@ def evaluate_blocking_recall(
 	paths = (source1_path, source2_path, source3_path)
 	if any(path is None for path in paths) and any(path is not None for path in paths):
 		raise ValueError("source1_path, source2_path, and source3_path must be supplied together")
+	if batch_size < 1:
+		raise ValueError("batch_size must be at least 1")
 	metadata_available = all(path is not None for path in paths)
 	preliminary_truth = _truth_pairs(ground_truth_df, None)
 	if metadata_available:
@@ -539,6 +787,7 @@ def evaluate_blocking_recall(
 			source3_path,
 			set(preliminary_truth["source1_entity_id"]),
 			set(preliminary_truth["candidate_entity_id"]),
+			batch_size,
 		)
 	else:
 		source1_df = source2_df = source3_df = None
@@ -700,7 +949,7 @@ def _smoke_test() -> None:
 			path = f"{temp_dir}/{source_name}.parquet"
 			frame.to_parquet(path, index=False)
 			paths.append(path)
-		candidates = generate_candidate_pairs(*paths)
+		candidates = generate_candidate_pairs(*paths, return_candidate_dataframe=True)
 		latin_pair = candidates.loc[candidates["candidate_entity_id"] == "S2-latin"].iloc[0]
 		fallback_pair = candidates.loc[candidates["candidate_entity_id"] == "S3-nonlatin"].iloc[0]
 		assert latin_pair["source1_entity_id"] == "S1-latin"
