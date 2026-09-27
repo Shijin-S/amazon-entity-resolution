@@ -30,3 +30,8 @@ models/*
 # Local outputs directory (ignore scratch output but track folder via .gitkeep)
 outputs/*
 !outputs/.gitkeep
+logs/
+.ipython/
+.jupyter_prefix/
+.ipython/
+.jupyter_prefix/
