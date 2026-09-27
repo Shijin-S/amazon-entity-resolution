@@ -1,13 +1,16 @@
 """Country-aware candidate generation and blocking recall validation."""
 
 import logging
+import gc
 from array import array
 from collections import defaultdict
 from collections.abc import Iterable
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import psutil
 
 
 LOGGER = logging.getLogger(__name__)
@@ -296,9 +299,9 @@ def _combine_block_reasons(reasons: Iterable[str]) -> str:
 
 
 def generate_candidate_pairs(
-	source1_df: pd.DataFrame,
-	source2_df: pd.DataFrame,
-	source3_df: pd.DataFrame,
+	source1_path: str,
+	source2_path: str,
+	source3_path: str,
 	*,
 	name_min_length: int = 4,
 	min_shared_address_tokens: int = 1,
@@ -313,50 +316,50 @@ def generate_candidate_pairs(
 	if min_shared_address_tokens < 1:
 		raise ValueError("min_shared_address_tokens must be at least 1")
 
-	required_columns = {
-		"entity_id",
-		"normalized_name",
-		"address_tokens",
-		"is_non_latin_name",
-		"normalized_country",
-	}
-	for source_name, frame in (
-		("source1", source1_df),
-		("source2", source2_df),
-		("source3", source3_df),
-	):
-		missing = required_columns.difference(frame.columns)
-		if missing:
-			raise ValueError(f"{source_name}_df is missing columns: {sorted(missing)}")
-
-	source1_records = _record_arrays(source1_df)
-	source1_country_positions = _country_positions(source1_df)
-	source1_country_counts = {
-		country: len(positions) for country, positions in source1_country_positions.items()
-	}
-	for source_name, frame in (
-		("source1", source1_df),
-		("source2", source2_df),
-		("source3", source3_df),
-	):
-		counts = frame["normalized_country"].fillna("").value_counts()
-		for country, count in counts.items():
-			LOGGER.info("Blocking records: source=%s country=%r rows=%d", source_name, country, count)
-
 	candidate_chunks: list[pd.DataFrame] = []
 	name_pair_count = 0
 	address_pair_count = 0
-	for candidate_source, target_frame in (
-		("source2", source2_df),
-		("source3", source3_df),
-	):
-		target_records = _record_arrays(target_frame)
-		target_country_positions = _country_positions(target_frame)
-		for country, target_positions in target_country_positions.items():
-			source1_positions = source1_country_positions.get(country)
-			source1_count = 0 if source1_positions is None else len(source1_positions)
-			if not source1_count or not len(target_positions):
+	process = psutil.Process()
+	LOGGER.info("Blocking function entry: rss_mb=%.1f", process.memory_info().rss / 1024 / 1024)
+	source1_countries = (
+		pd.read_parquet(source1_path, columns=["normalized_country"])
+		["normalized_country"]
+		.fillna("")
+		.drop_duplicates()
+		.tolist()
+	)
+	source1_count = 0
+	source2_count = 0
+	source3_count = 0
+	country_partition_count = len(source1_countries)
+	for country in source1_countries:
+		filters = [("normalized_country", "==", country)]
+		source1_partition = pd.read_parquet(source1_path, filters=filters).reset_index(drop=True)
+		source2_partition = pd.read_parquet(source2_path, filters=filters).reset_index(drop=True)
+		source3_partition = pd.read_parquet(source3_path, filters=filters).reset_index(drop=True)
+		source1_count += len(source1_partition)
+		source2_count += len(source2_partition)
+		source3_count += len(source3_partition)
+		LOGGER.info(
+			"Starting country partition: country=%r source1_rows=%d source2_rows=%d "
+			"source3_rows=%d rss_mb=%.1f",
+			country,
+			len(source1_partition),
+			len(source2_partition),
+			len(source3_partition),
+			process.memory_info().rss / 1024 / 1024,
+		)
+
+		source1_records = _record_arrays(source1_partition)
+		source1_positions = np.arange(len(source1_partition), dtype=np.int64)
+		for candidate_source, target_partition in (
+			("source2", source2_partition),
+			("source3", source3_partition),
+		):
+			if target_partition.empty:
 				continue
+			target_records = _record_arrays(target_partition)
+			target_positions = np.arange(len(target_partition), dtype=np.int64)
 			country_pairs, country_name_count, country_address_count = _block_country_partition(
 				source1_positions,
 				target_positions,
@@ -370,17 +373,25 @@ def generate_candidate_pairs(
 			address_pair_count += country_address_count
 			if not country_pairs.empty:
 				candidate_chunks.append(country_pairs)
-			LOGGER.info(
-				"Blocking partition: candidate_source=%s country=%r "
-				"source1_rows=%d target_rows=%d name_pairs=%d address_pairs=%d",
-				candidate_source,
-				country,
-				source1_count,
-				len(target_positions),
-				country_name_count,
-				country_address_count,
-			)
-		del target_records, target_country_positions
+			del target_records, target_positions, country_pairs
+
+		# Release all country-local frames, arrays, indexes, and temporary pair
+		# buffers before the next country. This bounds peak memory by the largest
+		# single country partition rather than accumulating both countries.
+		del (
+			source1_records,
+			source1_positions,
+			source1_partition,
+			source2_partition,
+			source3_partition,
+		)
+		gc.collect()
+		LOGGER.info(
+			"Finished country partition: country=%r rss_mb=%.1f",
+			country,
+			process.memory_info().rss / 1024 / 1024,
+		)
+	del source1_countries
 
 	if candidate_chunks:
 		candidate_pairs = pd.concat(candidate_chunks, ignore_index=True)
@@ -393,9 +404,9 @@ def generate_candidate_pairs(
 	else:
 		candidate_pairs = pd.DataFrame(columns=_OUTPUT_COLUMNS)
 
-	naive_pair_count = len(source1_df) * (len(source2_df) + len(source3_df))
+	naive_pair_count = source1_count * (source2_count + source3_count)
 	unique_pair_count = len(candidate_pairs)
-	average_per_source1 = unique_pair_count / len(source1_df) if len(source1_df) else 0.0
+	average_per_source1 = unique_pair_count / source1_count if source1_count else 0.0
 	reduction_ratio = (
 		1.0 - unique_pair_count / naive_pair_count if naive_pair_count else 0.0
 	)
@@ -403,10 +414,10 @@ def generate_candidate_pairs(
 		"Blocking summary: source1=%d source2=%d source3=%d country_partitions=%d "
 		"name_pairs=%d address_token_pairs=%d deduplicated_pairs=%d "
 		"average_candidates_per_source1=%.4f naive_cross_join=%d reduction_ratio=%.6f",
-		len(source1_df),
-		len(source2_df),
-		len(source3_df),
-		len(set(source1_country_counts) | set(source2_df["normalized_country"].fillna("")) | set(source3_df["normalized_country"].fillna(""))),
+		source1_count,
+		source2_count,
+		source3_count,
+		country_partition_count,
 		name_pair_count,
 		address_pair_count,
 		unique_pair_count,
@@ -446,31 +457,91 @@ def _truth_pairs(ground_truth_df: pd.DataFrame, source1_df: pd.DataFrame | None)
 	return truth.drop_duplicates(["source1_entity_id", "candidate_entity_id"]).reset_index(drop=True)
 
 
+def _load_recall_metadata(
+	source1_path: str,
+	source2_path: str,
+	source3_path: str,
+	source1_ids: set[object],
+	target_ids: set[object],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+	"""Load only metadata rows referenced by recall, one country at a time."""
+	source1_chunks: list[pd.DataFrame] = []
+	source2_chunks: list[pd.DataFrame] = []
+	source3_chunks: list[pd.DataFrame] = []
+	countries = (
+		pd.read_parquet(source1_path, columns=["normalized_country"])
+		["normalized_country"]
+		.fillna("")
+		.drop_duplicates()
+		.tolist()
+	)
+	for country in countries:
+		filters = [("normalized_country", "==", country)]
+		source1_partition = pd.read_parquet(
+			source1_path,
+			columns=["entity_id", "normalized_name", "is_non_latin_name"],
+			filters=filters,
+		)
+		matched_source1 = source1_partition.loc[source1_partition["entity_id"].isin(source1_ids)]
+		if not matched_source1.empty:
+			source1_chunks.append(matched_source1)
+		del source1_partition
+
+		for path, chunks in ((source2_path, source2_chunks), (source3_path, source3_chunks)):
+			partition = pd.read_parquet(
+				path,
+				columns=["entity_id", "is_non_latin_name"],
+				filters=filters,
+			)
+			matched = partition.loc[partition["entity_id"].isin(target_ids)]
+			if not matched.empty:
+				chunks.append(matched)
+			del partition
+		gc.collect()
+
+	def combine(chunks: list[pd.DataFrame], columns: list[str]) -> pd.DataFrame:
+		return pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=columns)
+
+	return (
+		combine(source1_chunks, ["entity_id", "normalized_name", "is_non_latin_name"]),
+		combine(source2_chunks, ["entity_id", "is_non_latin_name"]),
+		combine(source3_chunks, ["entity_id", "is_non_latin_name"]),
+	)
+
+
 def evaluate_blocking_recall(
 	candidate_pairs_df: pd.DataFrame,
 	ground_truth_df: pd.DataFrame,
 	*,
-	source1_df: pd.DataFrame | None = None,
-	source2_df: pd.DataFrame | None = None,
-	source3_df: pd.DataFrame | None = None,
+	source1_path: str | None = None,
+	source2_path: str | None = None,
+	source3_path: str | None = None,
 ) -> dict[str, Any]:
 	"""Measure pair-level blocking recall and report missed Source1 examples.
 
-	Pass the preprocessed source frames to scope a sampled run and calculate the
-	non-Latin breakdown plus names/addresses for misses. The two required
-	DataFrames alone contain identifiers only, so they cannot provide those
-	metadata fields.
+	Pass the preprocessed source paths to calculate the non-Latin breakdown plus
+	names for misses. Recall metadata is loaded one country at a time and only
+	rows referenced by the ground truth or candidate pairs are retained.
 	"""
 	required_candidate_columns = {"source1_entity_id", "candidate_entity_id"}
 	missing = required_candidate_columns.difference(candidate_pairs_df.columns)
 	if missing:
 		raise ValueError(f"candidate_pairs_df is missing columns: {sorted(missing)}")
-	if source1_df is not None and "entity_id" not in source1_df.columns:
-		raise ValueError("source1_df must contain entity_id")
-	for source_name, frame in (("source2_df", source2_df), ("source3_df", source3_df)):
-		if frame is not None and not {"entity_id", "is_non_latin_name"}.issubset(frame.columns):
-			raise ValueError(f"{source_name} must contain entity_id and is_non_latin_name")
-
+	paths = (source1_path, source2_path, source3_path)
+	if any(path is None for path in paths) and any(path is not None for path in paths):
+		raise ValueError("source1_path, source2_path, and source3_path must be supplied together")
+	metadata_available = all(path is not None for path in paths)
+	preliminary_truth = _truth_pairs(ground_truth_df, None)
+	if metadata_available:
+		source1_df, source2_df, source3_df = _load_recall_metadata(
+			source1_path,
+			source2_path,
+			source3_path,
+			set(preliminary_truth["source1_entity_id"]),
+			set(preliminary_truth["candidate_entity_id"]),
+		)
+	else:
+		source1_df = source2_df = source3_df = None
 	true_pairs = _truth_pairs(ground_truth_df, source1_df)
 	candidate_keys = candidate_pairs_df.loc[
 		:, ["source1_entity_id", "candidate_entity_id"]
@@ -491,7 +562,6 @@ def evaluate_blocking_recall(
 	]
 	true_pairs["recovered"] = recovered_flags
 
-	metadata_available = source1_df is not None and source2_df is not None and source3_df is not None
 	if metadata_available:
 		source1_metadata = source1_df.drop_duplicates("entity_id", keep="first").set_index("entity_id")
 		source1_flags = source1_metadata["is_non_latin_name"].to_dict()
@@ -618,36 +688,42 @@ def _smoke_test() -> None:
 		],
 		columns=source1.columns,
 	)
-	candidates = generate_candidate_pairs(source1, source2, source3)
-	latin_pair = candidates.loc[candidates["candidate_entity_id"] == "S2-latin"].iloc[0]
-	fallback_pair = candidates.loc[candidates["candidate_entity_id"] == "S3-nonlatin"].iloc[0]
-	assert latin_pair["source1_entity_id"] == "S1-latin"
-	assert latin_pair["block_reason"] in {"name", "both"}
-	assert fallback_pair["source1_entity_id"] == "S1-address"
-	assert fallback_pair["block_reason"] == "address_token"
-	assert "S2-other-country" not in set(candidates["candidate_entity_id"])
-	assert set(candidates["candidate_source"]) <= {"source2", "source3"}
-	assert not candidates["source1_entity_id"].isin({"S2-atlas", "S3-atlas"}).any()
-	assert {"S2-atlas", "S3-atlas"}.issubset(set(candidates["candidate_entity_id"]))
-
 	ground_truth = pd.DataFrame(
 		{
 			"source1_entity_id": ["S1-latin", "S1-address"],
 			"matched_entity_ids": ["S2-latin", "S3-nonlatin"],
 		}
 	)
-	print(">>> smoke candidate pairs")
-	print(candidates.to_string(index=False))
-	print(">>> smoke blocking recall")
-	print(
-		evaluate_blocking_recall(
-			candidates,
-			ground_truth,
-			source1_df=source1,
-			source2_df=source2,
-			source3_df=source3,
+	with TemporaryDirectory() as temp_dir:
+		paths = []
+		for source_name, frame in (("source1", source1), ("source2", source2), ("source3", source3)):
+			path = f"{temp_dir}/{source_name}.parquet"
+			frame.to_parquet(path, index=False)
+			paths.append(path)
+		candidates = generate_candidate_pairs(*paths)
+		latin_pair = candidates.loc[candidates["candidate_entity_id"] == "S2-latin"].iloc[0]
+		fallback_pair = candidates.loc[candidates["candidate_entity_id"] == "S3-nonlatin"].iloc[0]
+		assert latin_pair["source1_entity_id"] == "S1-latin"
+		assert latin_pair["block_reason"] in {"name", "both"}
+		assert fallback_pair["source1_entity_id"] == "S1-address"
+		assert fallback_pair["block_reason"] == "address_token"
+		assert "S2-other-country" not in set(candidates["candidate_entity_id"])
+		assert set(candidates["candidate_source"]) <= {"source2", "source3"}
+		assert not candidates["source1_entity_id"].isin({"S2-atlas", "S3-atlas"}).any()
+		assert {"S2-atlas", "S3-atlas"}.issubset(set(candidates["candidate_entity_id"]))
+
+		print(">>> smoke candidate pairs")
+		print(candidates.to_string(index=False))
+		print(">>> smoke blocking recall")
+		print(
+			evaluate_blocking_recall(
+				candidates,
+				ground_truth,
+				source1_path=paths[0],
+				source2_path=paths[1],
+				source3_path=paths[2],
+			)
 		)
-	)
 	print("Smoke test passed: country isolation and Source1-only comparisons verified.")
 
 

@@ -19,7 +19,16 @@ def _frame(rows):
 	)
 
 
-def test_candidate_generation_only_compares_source1_with_other_sources():
+def _write_sources(tmp_path, source1, source2, source3):
+	paths = []
+	for source_name, frame in (("source1", source1), ("source2", source2), ("source3", source3)):
+		path = tmp_path / f"{source_name}.parquet"
+		frame.to_parquet(path, index=False)
+		paths.append(str(path))
+	return paths
+
+
+def test_candidate_generation_only_compares_source1_with_other_sources(tmp_path):
 	"""Candidates are country-local and never contain a Source2/3 cross-pair."""
 	source1 = _frame(
 		[("S1-1", "acme widgets", ["42", "oak"], False, "us")]
@@ -34,18 +43,19 @@ def test_candidate_generation_only_compares_source1_with_other_sources():
 		[("S3-1", "acme widgets", ["42", "oak"], False, "us")]
 	)
 
-	candidates = generate_candidate_pairs(source1, source2, source3)
+	paths = _write_sources(tmp_path, source1, source2, source3)
+	candidates = generate_candidate_pairs(*paths)
 
 	assert set(candidates["candidate_entity_id"]) == {"S2-1", "S3-1"}
 	assert set(candidates["source1_entity_id"]) == {"S1-1"}
 	assert set(candidates["candidate_source"]) == {"source2", "source3"}
 	assert candidates["block_reason"].eq("both").all()
 	assert generate_candidate_pairs(
-		source1, source2, source3, min_shared_address_tokens=2
+		*paths, min_shared_address_tokens=2
 	)["block_reason"].eq("both").all()
 
 
-def test_address_fallback_finds_non_latin_target_and_threshold_is_configurable():
+def test_address_fallback_finds_non_latin_target_and_threshold_is_configurable(tmp_path):
 	"""A non-Latin endpoint uses address tokens, including a two-token option."""
 	source1 = _frame(
 		[("S1-1", "market house", ["9", "mumbai", "garden"], False, "india")]
@@ -55,13 +65,14 @@ def test_address_fallback_finds_non_latin_target_and_threshold_is_configurable()
 		[("S3-1", "भारत उद्योग", ["9", "mumbai", "garden"], True, "india")]
 	)
 
-	candidates = generate_candidate_pairs(source1, source2, source3)
+	paths = _write_sources(tmp_path, source1, source2, source3)
+	candidates = generate_candidate_pairs(*paths)
 	assert candidates.loc[0, "block_reason"] == "address_token"
-	assert len(generate_candidate_pairs(source1, source2, source3, min_shared_address_tokens=2)) == 1
-	assert len(generate_candidate_pairs(source1, source2, source3, min_shared_address_tokens=4)) == 0
+	assert len(generate_candidate_pairs(*paths, min_shared_address_tokens=2)) == 1
+	assert len(generate_candidate_pairs(*paths, min_shared_address_tokens=4)) == 0
 
 
-def test_recall_reports_misses_and_non_latin_stratum():
+def test_recall_reports_misses_and_non_latin_stratum(tmp_path):
 	"""Recall includes missed matches and classifies either non-Latin endpoint."""
 	source1 = _frame(
 		[
@@ -71,7 +82,8 @@ def test_recall_reports_misses_and_non_latin_stratum():
 	)
 	source2 = _frame([("S2-1", "plain company", ["1", "oak"], False, "us")])
 	source3 = _frame([("S3-1", "भारत उद्योग", ["2", "market"], True, "us")])
-	candidates = generate_candidate_pairs(source1, source2, source3)
+	paths = _write_sources(tmp_path, source1, source2, source3)
+	candidates = generate_candidate_pairs(*paths)
 	ground_truth = pd.DataFrame(
 		{
 			"source1_entity_id": ["S1-1", "S1-2"],
@@ -82,9 +94,9 @@ def test_recall_reports_misses_and_non_latin_stratum():
 	result = evaluate_blocking_recall(
 		candidates,
 		ground_truth,
-		source1_df=source1,
-		source2_df=source2,
-		source3_df=source3,
+		source1_path=paths[0],
+		source2_path=paths[1],
+		source3_path=paths[2],
 	)
 
 	assert result["true_match_count"] == 3
